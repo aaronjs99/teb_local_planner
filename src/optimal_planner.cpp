@@ -256,6 +256,8 @@ bool TebOptimalPlanner::plan(const std::vector<geometry_msgs::PoseStamped>& init
   {
     PoseSE2 start_(initial_plan.front().pose);
     PoseSE2 goal_(initial_plan.back().pose);
+    goal_.theta() = start_.theta() +
+        g2o::normalize_theta(goal_.theta() - start_.theta());
     if (teb_.sizePoses()>0
         && (goal_.position() - teb_.BackPose().position()).norm() < cfg_->trajectory.force_reinit_new_goal_dist
         && fabs(g2o::normalize_theta(goal_.theta() - teb_.BackPose().theta())) < cfg_->trajectory.force_reinit_new_goal_angular) // actual warm start!
@@ -288,24 +290,27 @@ bool TebOptimalPlanner::plan(const tf::Pose& start, const tf::Pose& goal, const 
 }
 
 bool TebOptimalPlanner::plan(const PoseSE2& start, const PoseSE2& goal, const geometry_msgs::Twist* start_vel, bool free_goal_vel)
-{	
+{
   ROS_ASSERT_MSG(initialized_, "Call initialize() first.");
+  PoseSE2 continuous_goal(goal);
+  continuous_goal.theta() = start.theta() +
+      g2o::normalize_theta(goal.theta() - start.theta());
   if (!teb_.isInit())
   {
     // init trajectory
-    teb_.initTrajectoryToGoal(start, goal, 0, cfg_->robot.max_vel_x, cfg_->trajectory.min_samples, cfg_->trajectory.allow_init_with_backwards_motion); // 0 intermediate samples, but dt=1 -> autoResize will add more samples before calling first optimization
+    teb_.initTrajectoryToGoal(start, continuous_goal, 0, cfg_->robot.max_vel_x, cfg_->trajectory.min_samples, cfg_->trajectory.allow_init_with_backwards_motion); // 0 intermediate samples, but dt=1 -> autoResize will add more samples before calling first optimization
   }
   else // warm start
   {
     if (teb_.sizePoses() > 0
-        && (goal.position() - teb_.BackPose().position()).norm() < cfg_->trajectory.force_reinit_new_goal_dist
-        && fabs(g2o::normalize_theta(goal.theta() - teb_.BackPose().theta())) < cfg_->trajectory.force_reinit_new_goal_angular) // actual warm start!
-      teb_.updateAndPruneTEB(start, goal, cfg_->trajectory.min_samples);
+        && (continuous_goal.position() - teb_.BackPose().position()).norm() < cfg_->trajectory.force_reinit_new_goal_dist
+        && fabs(g2o::normalize_theta(continuous_goal.theta() - teb_.BackPose().theta())) < cfg_->trajectory.force_reinit_new_goal_angular) // actual warm start!
+      teb_.updateAndPruneTEB(start, continuous_goal, cfg_->trajectory.min_samples);
     else // goal too far away -> reinit
     {
       ROS_DEBUG("New goal: distance to existing goal is higher than the specified threshold. Reinitalizing trajectories.");
       teb_.clearTimedElasticBand();
-      teb_.initTrajectoryToGoal(start, goal, 0, cfg_->robot.max_vel_x, cfg_->trajectory.min_samples, cfg_->trajectory.allow_init_with_backwards_motion);
+      teb_.initTrajectoryToGoal(start, continuous_goal, 0, cfg_->robot.max_vel_x, cfg_->trajectory.min_samples, cfg_->trajectory.allow_init_with_backwards_motion);
     }
   }
   if (start_vel)
@@ -922,7 +927,23 @@ void TebOptimalPlanner::AddEdgesKinematicsDiffDrive()
   Eigen::Matrix<double,2,2> information_kinematics;
   information_kinematics.fill(0.0);
   information_kinematics(0, 0) = cfg_->optim.weight_kinematics_nh;
-  information_kinematics(1, 1) = cfg_->optim.weight_kinematics_forward_drive;
+  double forward_drive_weight = cfg_->optim.weight_kinematics_forward_drive;
+  if (forward_drive_weight > 1.0 && teb_.sizePoses() > 1)
+  {
+    const Eigen::Vector2d goal_delta =
+        teb_.BackPose().position() - teb_.Pose(0).position();
+    if (goal_delta.norm() > 1e-6)
+    {
+      const Eigen::Vector2d heading(
+          std::cos(teb_.Pose(0).theta()), std::sin(teb_.Pose(0).theta()));
+      const double alignment = std::max(
+          -1.0, std::min(1.0, goal_delta.dot(heading) / goal_delta.norm()));
+      const double forward_blend = 0.5 * (1.0 + std::tanh(8.0 * alignment));
+      forward_drive_weight =
+          1.0 + (forward_drive_weight - 1.0) * forward_blend;
+    }
+  }
+  information_kinematics(1, 1) = forward_drive_weight;
   
   for (int i=0; i < teb_.sizePoses()-1; i++) // ignore twiced start only
   {
@@ -1110,8 +1131,7 @@ void TebOptimalPlanner::extractVelocity(const PoseSE2& pose1, const PoseSE2& pos
   {
     Eigen::Vector2d conf1dir( cos(pose1.theta()), sin(pose1.theta()) );
     // translational velocity
-    double dir = deltaS.dot(conf1dir);
-    vx = (double) g2o::sign(dir) * deltaS.norm()/dt;
+    vx = deltaS.dot(conf1dir) / dt;
     vy = 0;
   }
   else // holonomic robot
@@ -1142,14 +1162,16 @@ bool TebOptimalPlanner::getVelocityCommand(double& vx, double& vy, double& omega
     omega = 0;
     return false;
   }
-  look_ahead_poses = std::max(1, std::min(look_ahead_poses, teb_.sizePoses() - 1 - cfg_->trajectory.prevent_look_ahead_poses_near_goal));
+  const int max_look_ahead_poses = std::max(1, teb_.sizePoses() - 1 - cfg_->trajectory.prevent_look_ahead_poses_near_goal);
+  const double look_ahead_time = cfg_->trajectory.dt_ref * std::max(1, look_ahead_poses);
+  look_ahead_poses = 1;
   double dt = 0.0;
-  for(int counter = 0; counter < look_ahead_poses; ++counter)
+  for(int counter = 0; counter < max_look_ahead_poses; ++counter)
   {
     dt += teb_.TimeDiff(counter);
-    if(dt >= cfg_->trajectory.dt_ref * look_ahead_poses)  // TODO: change to look-ahead time? Refine trajectory?
+    look_ahead_poses = counter + 1;
+    if(dt >= look_ahead_time)
     {
-        look_ahead_poses = counter + 1;
         break;
     }
   }

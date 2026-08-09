@@ -306,15 +306,15 @@ void TebConfig::reconfigure(TebLocalPlannerReconfigureConfig& cfg)
     
 void TebConfig::checkParameters() const
 {
-  // positive backward velocity?
-  if (robot.max_vel_x_backwards <= 0)
-    ROS_WARN("TebLocalPlannerROS() Param Warning: Do not choose max_vel_x_backwards to be <=0. Disable backwards driving by increasing the optimization weight for penalyzing backwards driving.");
+  // A zero bound intentionally disables reverse motion.
+  if (robot.max_vel_x_backwards < 0)
+    ROS_WARN("TebLocalPlannerROS() Param Warning: max_vel_x_backwards must be nonnegative.");
   
   // bounds smaller than penalty epsilon
   if (robot.max_vel_x <= optim.penalty_epsilon)
     ROS_WARN("TebLocalPlannerROS() Param Warning: max_vel_x <= penalty_epsilon. The resulting bound is negative. Undefined behavior... Change at least one of them!");
   
-  if (robot.max_vel_x_backwards <= optim.penalty_epsilon)
+  if (robot.max_vel_x_backwards > 0 && robot.max_vel_x_backwards <= optim.penalty_epsilon)
     ROS_WARN("TebLocalPlannerROS() Param Warning: max_vel_x_backwards <= penalty_epsilon. The resulting bound is negative. Undefined behavior... Change at least one of them!");
   
   if (robot.max_vel_theta <= optim.penalty_epsilon)

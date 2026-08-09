@@ -393,6 +393,8 @@ bool TimedElasticBand::initTrajectoryToGoal(const std::vector<geometry_msgs::Pos
   {
     PoseSE2 start(plan.front().pose);
     PoseSE2 goal(plan.back().pose);
+    goal.theta() = start.theta() +
+        g2o::normalize_theta(goal.theta() - start.theta());
     
     addPose(start); // add starting point with given orientation
     setPoseVertexFixed(0,true); // StartConf is a fixed constraint during optimization

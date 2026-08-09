@@ -888,11 +888,12 @@ void TebLocalPlannerROS::saturateVelocity(double& vx, double& vy, double& omega,
     ratio_omega = std::abs(max_vel_theta / omega);
   
   // Limit backwards velocity
-  if (max_vel_x_backwards<=0)
+  if (max_vel_x_backwards < 0)
   {
-    ROS_WARN_ONCE("TebLocalPlannerROS(): Do not choose max_vel_x_backwards to be <=0. Disable backwards driving by increasing the optimization weight for penalyzing backwards driving.");
+    ROS_WARN_ONCE("TebLocalPlannerROS(): max_vel_x_backwards must be nonnegative; clamping reverse commands to zero.");
+    max_vel_x_backwards = 0;
   }
-  else if (vx < -max_vel_x_backwards)
+  if (vx < -max_vel_x_backwards)
     ratio_x = - max_vel_x_backwards / vx;
 
   if (cfg_.robot.use_proportional_saturation)
@@ -1217,5 +1218,4 @@ double TebLocalPlannerROS::getNumberFromXMLRPC(XmlRpc::XmlRpcValue& value, const
 }
 
 } // end namespace teb_local_planner
-
 
