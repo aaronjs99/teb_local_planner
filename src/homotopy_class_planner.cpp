@@ -683,8 +683,8 @@ int HomotopyClassPlanner::bestTebIdx() const
   return -1;
 }
 
-bool HomotopyClassPlanner::isTrajectoryFeasible(base_local_planner::CostmapModel* costmap_model, const std::vector<geometry_msgs::Point>& footprint_spec,
-                                                double inscribed_radius, double circumscribed_radius, int look_ahead_idx, double feasibility_check_lookahead_distance)
+bool HomotopyClassPlanner::isTrajectoryFeasible(SweptFootprint& collision, int look_ahead_idx,
+                                                double feasibility_check_lookahead_distance)
 {
   bool feasible = false;
   while(ros::ok() && !feasible && tebs_.size() > 0)
@@ -695,7 +695,7 @@ bool HomotopyClassPlanner::isTrajectoryFeasible(base_local_planner::CostmapModel
       ROS_ERROR("Couldn't retrieve the best plan");
       return false;
     }
-    feasible = best->isTrajectoryFeasible(costmap_model, footprint_spec, inscribed_radius, circumscribed_radius, look_ahead_idx, feasibility_check_lookahead_distance);
+    feasible = best->isTrajectoryFeasible(collision, look_ahead_idx, feasibility_check_lookahead_distance);
     if(!feasible)
     {
       removeTeb(best);

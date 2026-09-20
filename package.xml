@@ -39,6 +39,7 @@
   <depend>geometry_msgs</depend>
   <depend>interactive_markers</depend>
   <depend>libg2o</depend>
+  <depend>libnlopt-dev</depend>
   <depend>nav_core</depend>
   <depend>nav_msgs</depend>
   <depend>mbf_costmap_core</depend>

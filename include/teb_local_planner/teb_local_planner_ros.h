@@ -40,6 +40,7 @@
 #define TEB_LOCAL_PLANNER_ROS_H_
 
 #include <ros/ros.h>
+#include <boost/thread/mutex.hpp>
 
 // base local planner base class and utilities
 #include <nav_core/base_local_planner.h>
@@ -54,6 +55,8 @@
 #include <teb_local_planner/homotopy_class_planner.h>
 #include <teb_local_planner/visualization.h>
 #include <teb_local_planner/recovery_behaviors.h>
+#include <teb_local_planner/command_continuity.h>
+#include <teb_local_planner/terminal_observation.h>
 
 // message types
 #include <nav_msgs/Path.h>
@@ -94,6 +97,21 @@ class TebLocalPlannerROS : public nav_core::BaseLocalPlanner, public mbf_costmap
 {
 
 public:
+  void setPersistentGoal(bool enabled) { persistent_goal_ = enabled; }
+
+  // Unsupported planner modes reject active envelopes explicitly.
+  bool setStationEnvelope(const StationEnvelope& envelope);
+  // Route frame is scope identity; native plan transformation owns coordinates.
+  bool setCommandScope(const std::string& request_id, const std::string& route_frame,
+                       double reverse_limit, double nominal_horizon,
+                       double terminal_yaw_tolerance,
+                       bool terminal_yaw_optional);
+  void discardCommand();
+  void commitCommand(geometry_msgs::Twist& command);
+  const geometry_msgs::Twist& unshapedCommand() const { return unshaped_command_; }
+  std::uint64_t commandTimeNSec() const { return command_time_ns_; }
+  const PoseSE2& commandPredictionPose() const { return robot_pose_; }
+
   /**
     * @brief Default constructor of the teb plugin
     */
@@ -164,6 +182,10 @@ public:
     * @return True if achieved, false otherwise
     */
   bool isGoalReached();
+  TerminalObservation terminalObservation() const {
+    boost::mutex::scoped_lock lock(terminal_observation_mutex_);
+    return terminal_observation_;
+  }
 
   /**
     * @brief Dummy version to satisfy MBF API
@@ -387,7 +409,7 @@ protected:
   void validateFootprints(double opt_inscribed_radius, double costmap_inscribed_radius, double min_obst_dist);
   
   
-  void configureBackupModes(std::vector<geometry_msgs::PoseStamped>& transformed_plan,  int& goal_idx);
+  void configureBackupModes(std::vector<geometry_msgs::PoseStamped>& transformed_plan, int& goal_idx, bool preserve_goal = false);
 
 
   
@@ -404,7 +426,16 @@ private:
   ObstContainer obstacles_; //!< Obstacle vector that should be considered during local trajectory optimization
   ViaPointContainer via_points_; //!< Container of via-points that should be considered during local trajectory optimization
   TebVisualizationPtr visualization_; //!< Instance of the visualization class (local/global plan, obstacles, ...)
-  boost::shared_ptr<base_local_planner::CostmapModel> costmap_model_;  
+  StationEnvelope station_envelope_;
+  CommandContinuity command_continuity_;
+  double command_terminal_yaw_tolerance_ = -1.0;
+  bool command_terminal_yaw_optional_ = false;
+  double command_period_sec_ = 0.0;
+  double command_reverse_limit_ = 0.0;
+  geometry_msgs::Twist unshaped_command_;
+  std::uint64_t command_time_ns_ = 0;
+  std::uint64_t command_proposal_ns_ = 0;
+  bool isCommandArcFeasible(const geometry_msgs::Twist& command, SweptFootprint& collision) const;
   TebConfig cfg_; //!< Config class that stores and manages all related parameters
   FailureDetector failure_detector_; //!< Detect if the robot got stucked
   
@@ -427,7 +458,11 @@ private:
   PoseSE2 robot_pose_; //!< Store current robot pose
   PoseSE2 robot_goal_; //!< Store current robot goal
   geometry_msgs::Twist robot_vel_; //!< Store current robot translational and angular velocity (vx, vy, omega)
+  bool persistent_goal_ = false;
   bool goal_reached_; //!< store whether the goal is reached or not
+  mutable boost::mutex terminal_observation_mutex_;
+  TerminalObservation terminal_observation_;
+  void resetTerminalObservation(bool new_plan);
   ros::Time time_last_infeasible_plan_; //!< Store at which time stamp the last infeasible plan was detected
   int no_infeasible_plans_; //!< Store how many times in a row the planner failed to find a feasible plan.
   ros::Time time_last_oscillation_; //!< Store at which time stamp the last oscillation was detected
@@ -452,4 +487,3 @@ public:
 }; // end namespace teb_local_planner
 
 #endif // TEB_LOCAL_PLANNER_ROS_H_
-

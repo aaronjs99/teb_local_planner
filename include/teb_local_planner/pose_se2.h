@@ -213,6 +213,20 @@ public:
    * @returns [cos(theta), sin(theta))]^T
    */  
   Eigen::Vector2d orientationUnitVec() const {return Eigen::Vector2d(std::cos(_theta), std::sin(_theta));}
+
+  // One signed longitudinal displacement for nonholonomic costs and output.
+  // The default is the initial-body projection. Exact mode inverts a held
+  // unicycle twist using the midpoint heading and its chord-to-arc factor.
+  double longitudinalDistanceTo(const PoseSE2& next, bool exact_arc_length) const
+  {
+    const double half = exact_arc_length
+        ? 0.5 * g2o::normalize_theta(next.theta() - theta()) : 0.0;
+    const double sinc = std::abs(half) < 1e-8
+        ? 1.0 - half * half / 6.0 : std::sin(half) / half;
+    const Eigen::Vector2d direction(std::cos(theta() + half), std::sin(theta() + half));
+    return (next.position() - position()).dot(direction) / sinc;
+  }
+
       
   ///@}
 

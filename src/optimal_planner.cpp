@@ -1,3 +1,5 @@
+#include <nlopt.h>
+#include <Eigen/Eigenvalues>
 /*********************************************************************
  *
  * Software License Agreement (BSD License)
@@ -37,6 +39,7 @@
  *********************************************************************/
 
 #include <teb_local_planner/optimal_planner.h>
+#include <teb_local_planner/g2o_types/edge_station_envelope.h>
 
 // g2o custom edges and vertices for the TEB planner
 #include <teb_local_planner/g2o_types/edge_velocity.h>
@@ -150,6 +153,7 @@ void TebOptimalPlanner::registerG2OTypes()
   factory->registerType("EDGE_INFLATED_OBSTACLE", new g2o::HyperGraphElementCreator<EdgeInflatedObstacle>);
   factory->registerType("EDGE_DYNAMIC_OBSTACLE", new g2o::HyperGraphElementCreator<EdgeDynamicObstacle>);
   factory->registerType("EDGE_VIA_POINT", new g2o::HyperGraphElementCreator<EdgeViaPoint>);
+  factory->registerType("EDGE_STATION_ENVELOPE", new g2o::HyperGraphElementCreator<EdgeStationEnvelope>);
   factory->registerType("EDGE_PREFER_ROTDIR", new g2o::HyperGraphElementCreator<EdgePreferRotDir>);
   return;
 }
@@ -189,6 +193,7 @@ bool TebOptimalPlanner::optimizeTEB(int iterations_innerloop, int iterations_out
   optimized_ = false;
   
   double weight_multiplier = 1.0;
+  const PoseSE2 requested_goal = teb_.BackPose();
 
   // TODO(roesmann): we introduced the non-fast mode with the support of dynamic obstacles
   //                (which leads to better results in terms of x-y-t homotopy planning).
@@ -198,7 +203,8 @@ bool TebOptimalPlanner::optimizeTEB(int iterations_innerloop, int iterations_out
   
   for(int i=0; i<iterations_outerloop; ++i)
   {
-    if (cfg_->trajectory.teb_autosize)
+    if (cfg_->trajectory.teb_autosize &&
+        !(cfg_->robot.max_vel_y == 0 && cfg_->robot.min_turning_radius == 0))
     {
       //teb_.autoResize(cfg_->trajectory.dt_ref, cfg_->trajectory.dt_hysteresis, cfg_->trajectory.min_samples, cfg_->trajectory.max_samples);
       teb_.autoResize(cfg_->trajectory.dt_ref, cfg_->trajectory.dt_hysteresis, cfg_->trajectory.min_samples, cfg_->trajectory.max_samples, fast_mode);
@@ -211,7 +217,9 @@ bool TebOptimalPlanner::optimizeTEB(int iterations_innerloop, int iterations_out
         clearGraph();
         return false;
     }
-    success = optimizeGraph(iterations_innerloop, false);
+    success = (cfg_->robot.max_vel_y == 0 && cfg_->robot.min_turning_radius == 0)
+        ? optimizeControlTrajectory(iterations_innerloop, requested_goal)
+        : optimizeGraph(iterations_innerloop, false);
     if (!success) 
     {
         clearGraph();
@@ -224,6 +232,8 @@ bool TebOptimalPlanner::optimizeTEB(int iterations_innerloop, int iterations_out
       
     clearGraph();
     
+    if (cfg_->robot.max_vel_y == 0 && cfg_->robot.min_turning_radius == 0 &&
+        std::chrono::steady_clock::now() >= control_deadline_) break;
     weight_multiplier *= cfg_->optim.weight_adapt_factor;
   }
 
@@ -247,29 +257,67 @@ void TebOptimalPlanner::setVelocityGoal(const geometry_msgs::Twist& vel_goal)
 bool TebOptimalPlanner::plan(const std::vector<geometry_msgs::PoseStamped>& initial_plan, const geometry_msgs::Twist* start_vel, bool free_goal_vel)
 {    
   ROS_ASSERT_MSG(initialized_, "Call initialize() first.");
-  if (!teb_.isInit())
-  {
-    teb_.initTrajectoryToGoal(initial_plan, cfg_->robot.max_vel_x, cfg_->robot.max_vel_theta, cfg_->trajectory.global_plan_overwrite_orientation,
-      cfg_->trajectory.min_samples, cfg_->trajectory.allow_init_with_backwards_motion);
-  }
-  else // warm start
-  {
-    PoseSE2 start_(initial_plan.front().pose);
-    PoseSE2 goal_(initial_plan.back().pose);
-    goal_.theta() = start_.theta() +
-        g2o::normalize_theta(goal_.theta() - start_.theta());
-    if (teb_.sizePoses()>0
-        && (goal_.position() - teb_.BackPose().position()).norm() < cfg_->trajectory.force_reinit_new_goal_dist
-        && fabs(g2o::normalize_theta(goal_.theta() - teb_.BackPose().theta())) < cfg_->trajectory.force_reinit_new_goal_angular) // actual warm start!
-      teb_.updateAndPruneTEB(start_, goal_, cfg_->trajectory.min_samples); // update TEB
-    else // goal too far away -> reinit
+  control_deadline_ = std::chrono::steady_clock::now() +
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(cfg_->trajectory.dt_ref));
+  const bool differential = cfg_->robot.max_vel_y == 0 && cfg_->robot.min_turning_radius == 0;
+  const PoseSE2 start(initial_plan.front().pose);
+  PoseSE2 goal(initial_plan.back().pose);
+  goal.theta() = start.theta();
+  for (std::size_t i = 1; i < initial_plan.size(); ++i)
+    goal.theta() += g2o::normalize_theta(PoseSE2(initial_plan[i].pose).theta() -
+                                       PoseSE2(initial_plan[i-1].pose).theta());
+  // Keep the chosen angular branch while replanning the same goal.  Near the
+  // antipodal heading, independently wrapping every update can alternate
+  // between +pi and -pi and reverse the command before either turn completes.
+  if (teb_.isInit() &&
+      (goal.position()-teb_.BackPose().position()).norm() <
+          cfg_->trajectory.force_reinit_new_goal_dist &&
+      std::abs(g2o::normalize_theta(goal.theta()-teb_.BackPose().theta())) <
+          cfg_->trajectory.force_reinit_new_goal_angular)
+    goal.theta() = teb_.BackPose().theta() +
+        g2o::normalize_theta(goal.theta()-teb_.BackPose().theta());
+  const auto initialize = [&]() {
+    teb_.clearTimedElasticBand();
+    teb_.initTrajectoryToGoal(initial_plan, cfg_->robot.max_vel_x, cfg_->robot.max_vel_theta,
+        cfg_->trajectory.global_plan_overwrite_orientation, cfg_->trajectory.min_samples,
+        cfg_->trajectory.allow_init_with_backwards_motion, differential);
+    teb_.BackPose().theta() = goal.theta();
+    if (!differential) return;
+    // Subdivide without changing geometry so bounded controls retain the endpoint.
+    const double max_interval = M_PI/(2*std::max(1e-6,cfg_->robot.max_vel_theta));
+    for (int i = 0; i < teb_.sizeTimeDiffs(); ++i)
     {
-      ROS_DEBUG("New goal: distance to existing goal is higher than the specified threshold. Reinitalizing trajectories.");
-      teb_.clearTimedElasticBand();
-      teb_.initTrajectoryToGoal(initial_plan, cfg_->robot.max_vel_x, cfg_->robot.max_vel_theta, cfg_->trajectory.global_plan_overwrite_orientation,
-        cfg_->trajectory.min_samples, cfg_->trajectory.allow_init_with_backwards_motion);
+      const PoseSE2 from=teb_.Pose(i), to=teb_.Pose(i+1);
+      const double turn=g2o::normalize_theta(to.theta()-from.theta());
+      const double distance=from.longitudinalDistanceTo(to,true);
+      const double duration=std::max(std::abs(distance)/std::max(1e-6,distance<0?cfg_->robot.max_vel_x_backwards:cfg_->robot.max_vel_x),
+                                     std::abs(turn)/std::max(1e-6,cfg_->robot.max_vel_theta));
+      if (duration > max_interval || std::abs(turn) > M_PI/2)
+      {
+        const double quarter=turn*.25;
+        const double sinc=std::abs(quarter)<1e-8?1-quarter*quarter/6:std::sin(quarter)/quarter;
+        const PoseSE2 midpoint(from.x()+distance*.5*sinc*std::cos(from.theta()+quarter),
+                              from.y()+distance*.5*sinc*std::sin(from.theta()+quarter),from.theta()+turn*.5);
+        const double half_dt=.5*teb_.TimeDiff(i);
+        teb_.TimeDiff(i)=half_dt;
+        teb_.insertPose(i+1,midpoint);
+        teb_.insertTimeDiff(i+1,half_dt);
+        --i;
+      }
     }
-  }
+    for (int i = 0; i < teb_.sizePoses(); ++i)
+      teb_.setPoseVertexFixed(i, i == 0);
+  };
+  const bool warm_start = teb_.isInit() &&
+      (goal.position() - teb_.BackPose().position()).norm() < cfg_->trajectory.force_reinit_new_goal_dist &&
+      std::abs(g2o::normalize_theta(goal.theta() - teb_.BackPose().theta())) < cfg_->trajectory.force_reinit_new_goal_angular;
+  if (warm_start)
+    // The shifted band is only a guess. The control rollout must recover an
+    // executable trajectory and the requested endpoint before it can be used.
+    teb_.updateAndPruneTEB(start, goal, cfg_->trajectory.min_samples,
+        differential ? cfg_->robot.max_vel_x : 0, differential ? cfg_->robot.max_vel_theta : 0);
+  else
+    initialize();
   if (start_vel)
     setVelocityStart(*start_vel);
   if (free_goal_vel)
@@ -277,7 +325,10 @@ bool TebOptimalPlanner::plan(const std::vector<geometry_msgs::PoseStamped>& init
   else
     vel_goal_.first = true; // we just reactivate and use the previously set velocity (should be zero if nothing was modified)
   
-  // now optimize
+  if (optimizeTEB(cfg_->optim.no_inner_iterations, cfg_->optim.no_outer_iterations))
+    return true;
+  if (!warm_start) return false;
+  initialize();
   return optimizeTEB(cfg_->optim.no_inner_iterations, cfg_->optim.no_outer_iterations);
 }
 
@@ -286,42 +337,19 @@ bool TebOptimalPlanner::plan(const tf::Pose& start, const tf::Pose& goal, const 
 {
   PoseSE2 start_(start);
   PoseSE2 goal_(goal);
-  return plan(start_, goal_, start_vel);
+  return plan(start_, goal_, start_vel, free_goal_vel);
 }
 
 bool TebOptimalPlanner::plan(const PoseSE2& start, const PoseSE2& goal, const geometry_msgs::Twist* start_vel, bool free_goal_vel)
 {
-  ROS_ASSERT_MSG(initialized_, "Call initialize() first.");
-  PoseSE2 continuous_goal(goal);
-  continuous_goal.theta() = start.theta() +
-      g2o::normalize_theta(goal.theta() - start.theta());
-  if (!teb_.isInit())
-  {
-    // init trajectory
-    teb_.initTrajectoryToGoal(start, continuous_goal, 0, cfg_->robot.max_vel_x, cfg_->trajectory.min_samples, cfg_->trajectory.allow_init_with_backwards_motion); // 0 intermediate samples, but dt=1 -> autoResize will add more samples before calling first optimization
-  }
-  else // warm start
-  {
-    if (teb_.sizePoses() > 0
-        && (continuous_goal.position() - teb_.BackPose().position()).norm() < cfg_->trajectory.force_reinit_new_goal_dist
-        && fabs(g2o::normalize_theta(continuous_goal.theta() - teb_.BackPose().theta())) < cfg_->trajectory.force_reinit_new_goal_angular) // actual warm start!
-      teb_.updateAndPruneTEB(start, continuous_goal, cfg_->trajectory.min_samples);
-    else // goal too far away -> reinit
-    {
-      ROS_DEBUG("New goal: distance to existing goal is higher than the specified threshold. Reinitalizing trajectories.");
-      teb_.clearTimedElasticBand();
-      teb_.initTrajectoryToGoal(start, continuous_goal, 0, cfg_->robot.max_vel_x, cfg_->trajectory.min_samples, cfg_->trajectory.allow_init_with_backwards_motion);
-    }
-  }
-  if (start_vel)
-    setVelocityStart(*start_vel);
-  if (free_goal_vel)
-    setVelocityGoalFree();
-  else
-    vel_goal_.first = true; // we just reactivate and use the previously set velocity (should be zero if nothing was modified)
-      
-  // now optimize
-  return optimizeTEB(cfg_->optim.no_inner_iterations, cfg_->optim.no_outer_iterations);
+  std::vector<geometry_msgs::PoseStamped> initial_plan(2);
+  initial_plan.front().pose.position.x = start.x();
+  initial_plan.front().pose.position.y = start.y();
+  initial_plan.front().pose.orientation = tf::createQuaternionMsgFromYaw(start.theta());
+  initial_plan.back().pose.position.x = goal.x();
+  initial_plan.back().pose.position.y = goal.y();
+  initial_plan.back().pose.orientation = tf::createQuaternionMsgFromYaw(goal.theta());
+  return plan(initial_plan, start_vel, free_goal_vel);
 }
 
 
@@ -348,6 +376,7 @@ bool TebOptimalPlanner::buildGraph(double weight_multiplier)
     AddEdgesDynamicObstacles();
   
   AddEdgesViaPoints();
+  AddEdgesStationEnvelope();
   
   AddEdgesVelocity();
   
@@ -368,6 +397,233 @@ bool TebOptimalPlanner::buildGraph(double weight_multiplier)
     AddEdgesVelocityObstacleRatio();
     
   return true;  
+}
+
+
+namespace {
+// One rollout is the shared source of poses for all existing TEB residuals.
+struct ControlTrajectoryResidual {
+  TimedElasticBand& band;
+  const TebConfig& cfg;
+  PoseSE2 start, goal;
+  std::vector<g2o::OptimizableGraph::Edge*> edges;
+  std::vector<Eigen::MatrixXd> roots;
+  int dimension = 3;
+  double best_cost=HUGE_VAL;
+  std::vector<double> best_controls;
+  // Endpoint equality alone cannot distinguish a direct heading correction
+  // from an unnecessary full turn followed by the opposite full turn. Keep
+  // optimization in the seed trajectory's angular winding class.
+  double maximum_absolute_turn=HUGE_VAL;
+  nlopt_opt optimizer = nullptr;
+  std::chrono::steady_clock::time_point deadline;
+  bool timedOut() const {
+    if (std::chrono::steady_clock::now() < deadline) return false;
+    if (optimizer) nlopt_force_stop(optimizer);
+    return true;
+  }
+
+  ControlTrajectoryResidual(TimedElasticBand& b, const TebConfig& c,
+                            const g2o::SparseOptimizer& graph, const PoseSE2& target)
+      : band(b), cfg(c), start(b.Pose(0)), goal(target) {
+    for (auto* item : graph.edges()) {
+      auto* edge = static_cast<g2o::OptimizableGraph::Edge*>(item);
+      const int n = edge->dimension();
+      Eigen::Map<const Eigen::MatrixXd> information(edge->informationData(), n, n);
+      Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigen(information);
+      roots.push_back(eigen.eigenvalues().cwiseMax(0).cwiseSqrt().asDiagonal()
+                      * eigen.eigenvectors().transpose());
+      edges.push_back(edge);
+      dimension += n;
+    }
+  }
+
+  bool operator()(double const* const* parameters, double* residuals) const {
+    const double* u = parameters[0];
+    band.Pose(0) = start;
+    for (int i = 0; i < band.sizeTimeDiffs(); ++i) {
+      const double v = u[3*i], w = u[3*i+1], dt = u[3*i+2];
+      if (!std::isfinite(v+w+dt) || dt <= 0) return false;
+      const double half = w * dt * .5;
+      const double sinc = std::abs(half) < 1e-8 ? 1-half*half/6 : std::sin(half)/half;
+      const auto& previous = band.Pose(i);
+      band.Pose(i+1) = PoseSE2(previous.x()+v*dt*sinc*std::cos(previous.theta()+half),
+                              previous.y()+v*dt*sinc*std::sin(previous.theta()+half),
+                              previous.theta()+2*half);
+      band.TimeDiff(i) = dt;
+    }
+    int offset = 0;
+    for (std::size_t i = 0; i < edges.size(); ++i) {
+      edges[i]->computeError();
+      const int n = edges[i]->dimension();
+      Eigen::Map<Eigen::VectorXd> output(residuals+offset,n);
+      output = roots[i] * Eigen::Map<const Eigen::VectorXd>(edges[i]->errorData(),n);
+      if (!output.allFinite()) return false;
+      offset += n;
+    }
+    const auto error = band.BackPose().position()-goal.position();
+    residuals[offset] = error.x();
+    residuals[offset+1] = error.y();
+    residuals[offset+2] = band.BackPose().theta()-goal.theta();
+    return true;
+  }
+  Eigen::MatrixXd rolloutJacobian(const double* u) const {
+    const int count=band.sizeTimeDiffs();
+    Eigen::MatrixXd jac=Eigen::MatrixXd::Zero(3*(count+1),3*count);
+    for(int i=0;i<count;++i) {
+      const double v=u[3*i],w=u[3*i+1],dt=u[3*i+2],h=w*dt*.5;
+      const double sinc=std::abs(h)<1e-8?1-h*h/6:std::sin(h)/h;
+      const double dsinc=std::abs(h)<1e-8?-h/3:(h*std::cos(h)-std::sin(h))/(h*h);
+      const double angle=band.Pose(i).theta()+h,c=std::cos(angle),s=std::sin(angle);
+      const double dx=v*dt*sinc*c,dy=v*dt*sinc*s;
+      jac.block(3*(i+1),0,3,3*count)=jac.block(3*i,0,3,3*count);
+      jac.row(3*(i+1))-=dy*jac.row(3*i+2);
+      jac.row(3*(i+1)+1)+=dx*jac.row(3*i+2);
+      jac(3*(i+1),3*i)+=dt*sinc*c;
+      jac(3*(i+1)+1,3*i)+=dt*sinc*s;
+      jac(3*(i+1),3*i+1)+=v*dt*dt*.5*(dsinc*c-sinc*s);
+      jac(3*(i+1)+1,3*i+1)+=v*dt*dt*.5*(dsinc*s+sinc*c);
+      jac(3*(i+1)+2,3*i+1)+=dt;
+      jac(3*(i+1),3*i+2)+=v*(sinc*c+dt*w*.5*(dsinc*c-sinc*s));
+      jac(3*(i+1)+1,3*i+2)+=v*(sinc*s+dt*w*.5*(dsinc*s+sinc*c));
+      jac(3*(i+1)+2,3*i+2)+=w;
+    }
+    return jac;
+  }
+
+  double absoluteTurn(const double* controls) const {
+    double total=0;
+    for(int i=0;i<band.sizeTimeDiffs();++i)
+      total+=std::abs(controls[3*i+1]*controls[3*i+2]);
+    return total;
+  }
+
+  bool preservesWindingClass(const double* controls) const {
+    return absoluteTurn(controls)<=maximum_absolute_turn+1e-3;
+  }
+
+  static double incidentCost(const g2o::HyperGraph::Vertex& vertex) {
+    double cost=0;
+    for(auto* item:vertex.edges()) {
+      auto* edge=static_cast<g2o::OptimizableGraph::Edge*>(item);
+      edge->computeError();cost+=.5*edge->chi2();
+    }
+    return cost;
+  }
+
+  static double objective(unsigned n, const double* values, double* gradient, void* data) {
+    auto& self=*static_cast<ControlTrajectoryResidual*>(data);
+    std::vector<double> errors(self.dimension);
+    if(!self(&values,errors.data()))return HUGE_VAL;
+    double cost=0;
+    for(int i=0;i<self.dimension-3;++i)cost+=.5*errors[i]*errors[i];
+    bool feasible=true;
+    for(int i=self.dimension-3;i<self.dimension;++i)feasible=feasible&&std::abs(errors[i])<=1e-6;
+    if(feasible&&self.preservesWindingClass(values)&&cost<self.best_cost) {
+      self.best_cost=cost;
+      self.best_controls.assign(values,values+n);
+    }
+    if(gradient) {
+      std::fill(gradient,gradient+n,0.0);
+      Eigen::VectorXd pose_gradient=Eigen::VectorXd::Zero(3*self.band.sizePoses());
+      for(int i=1;i<self.band.sizePoses();++i) {
+        if(self.timedOut())return cost;
+        auto& pose=self.band.Pose(i);
+        double* coordinates[]={&pose.x(),&pose.y(),&pose.theta()};
+        for(int j=0;j<3;++j) {
+          const double value=*coordinates[j],h=1e-6*std::max(1.0,std::abs(value));
+          *coordinates[j]=value+h;double plus=incidentCost(*self.band.PoseVertex(i));
+          *coordinates[j]=value-h;double minus=incidentCost(*self.band.PoseVertex(i));
+          *coordinates[j]=value;pose_gradient[3*i+j]=(plus-minus)/(2*h);
+        }
+      }
+      Eigen::Map<Eigen::VectorXd> output(gradient,n);
+      output=self.rolloutJacobian(values).transpose()*pose_gradient;
+      for(int i=0;i<self.band.sizeTimeDiffs();++i) {
+        double& dt=self.band.TimeDiff(i);const double value=dt,h=1e-6*std::max(1.0,value);
+        dt=value+h;double plus=incidentCost(*self.band.TimeDiffVertex(i));
+        dt=value-h;double minus=incidentCost(*self.band.TimeDiffVertex(i));
+        dt=value;output[3*i+2]+=(plus-minus)/(2*h);
+      }
+    }
+    return cost;
+  }
+
+  static void endpoint(unsigned m,double* result,unsigned n,const double* values,double* gradient,void* data) {
+    auto& self=*static_cast<ControlTrajectoryResidual*>(data);
+    // Endpoint derivatives use the analytic motion Jacobian, not graph probes.
+    std::vector<double> residual(self.dimension);
+    if(!self(&values,residual.data())) {for(unsigned i=0;i<m;++i)result[i]=HUGE_VAL;return;}
+    for(unsigned i=0;i<m;++i)result[i]=residual[self.dimension-3+i];
+    if(gradient) {
+      Eigen::Map<Eigen::Matrix<double,Eigen::Dynamic,Eigen::Dynamic,Eigen::RowMajor>> out(gradient,m,n);
+      out=self.rolloutJacobian(values).bottomRows(3);
+    }
+  }
+
+};
+}
+
+bool TebOptimalPlanner::optimizeControlTrajectory(int iterations, const PoseSE2& goal)
+{
+  const int count = teb_.sizeTimeDiffs();
+  if (count < 1) return false;
+  std::vector<double> controls(3*count);
+  const double max_dt = M_PI / (2*std::max(1e-6,cfg_->robot.max_vel_theta));
+  for (int i=0;i<count;++i) {
+    double v,vy,w;
+    extractVelocity(teb_.Pose(i),teb_.Pose(i+1),teb_.TimeDiff(i),v,vy,w);
+    const double scale=std::max(1.0,std::max(std::abs(v)/std::max(1e-6,v<0?cfg_->robot.max_vel_x_backwards:cfg_->robot.max_vel_x),
+                                        std::abs(w)/std::max(1e-6,cfg_->robot.max_vel_theta)));
+    const double dt=std::max(1e-3,std::min(max_dt,teb_.TimeDiff(i)*scale));
+    controls[3*i]=v*teb_.TimeDiff(i)/dt;
+    controls[3*i+1]=w*teb_.TimeDiff(i)/dt;
+    controls[3*i+2]=dt;
+  }
+  ControlTrajectoryResidual residual(teb_,*cfg_,*optimizer_,goal);
+  const std::vector<double> seed=controls;
+  residual.maximum_absolute_turn=residual.absoluteTurn(seed.data());
+  std::vector<double> lower(controls.size()),upper(controls.size());
+  for(int i=0;i<count;++i) {
+    lower[3*i]=-cfg_->robot.max_vel_x_backwards;upper[3*i]=cfg_->robot.max_vel_x;
+    lower[3*i+1]=-cfg_->robot.max_vel_theta;upper[3*i+1]=cfg_->robot.max_vel_theta;
+    lower[3*i+2]=1e-3;upper[3*i+2]=max_dt;
+  }
+  nlopt_opt optimizer=nlopt_create(NLOPT_LD_SLSQP,controls.size());
+  if(!optimizer)return false;
+  residual.optimizer=optimizer;
+  residual.deadline=control_deadline_;
+  nlopt_set_lower_bounds(optimizer,lower.data());
+  nlopt_set_upper_bounds(optimizer,upper.data());
+  nlopt_set_min_objective(optimizer,ControlTrajectoryResidual::objective,&residual);
+  const double tolerance[3]={1e-6,1e-6,1e-6};
+  nlopt_add_equality_mconstraint(optimizer,3,ControlTrajectoryResidual::endpoint,&residual,tolerance);
+  // Preferred obstacle spacing stays in TEB's objective. Collision feasibility
+  // is checked against the costmap footprint along the resulting motion.
+  nlopt_set_maxeval(optimizer,std::max(1,iterations)*count*10);
+  const double remaining=std::chrono::duration<double>(control_deadline_-std::chrono::steady_clock::now()).count();
+  nlopt_set_maxtime(optimizer,std::max(1e-6,remaining));
+  double cost=0;
+  const nlopt_result solve_result=remaining>0 ? nlopt_optimize(optimizer,controls.data(),&cost) : NLOPT_MAXTIME_REACHED;
+  ROS_DEBUG("Control solve status=%d evaluations=%d objective=%g best_feasible=%g",int(solve_result),nlopt_get_numevals(optimizer),cost,residual.best_cost);
+  nlopt_destroy(optimizer);
+  auto restore=[&](const std::vector<double>& candidate) {
+    for(std::size_t i=0;i<candidate.size();++i)
+      if(!std::isfinite(candidate[i]) || candidate[i]<lower[i]-1e-9 || candidate[i]>upper[i]+1e-9)return false;
+    std::vector<double> errors(residual.dimension);
+    const double* values=candidate.data();
+    if(!residual.preservesWindingClass(values))return false;
+    if(!residual(&values,errors.data()))return false;
+    for(int i=residual.dimension-3;i<residual.dimension;++i)
+      if(std::abs(errors[i])>1e-6)return false;
+    return true;
+  };
+  // A time-limited solve may stop outside the equality manifold. Retain the
+  // feasible seed rather than publishing a trajectory to a different endpoint.
+  if(!residual.best_controls.empty() && restore(residual.best_controls))return true;
+  if(restore(controls))return true;
+  ROS_DEBUG("Control trajectory solver status=%d; retaining feasible initial trajectory",int(solve_result));
+  return restore(seed);
 }
 
 bool TebOptimalPlanner::optimizeGraph(int no_iterations,bool clear_after)
@@ -722,6 +978,21 @@ void TebOptimalPlanner::AddEdgesViaPoints()
   }
 }
 
+void TebOptimalPlanner::AddEdgesStationEnvelope()
+{
+  if (!station_envelope_.enabled) return;
+  Eigen::Matrix<double,1,1> information;
+  information.fill(10000.0);
+  for (int i = 0; i < teb_.sizePoses(); ++i) {
+    if (teb_.PoseVertex(i)->fixed()) continue;
+    auto* edge = new EdgeStationEnvelope;
+    edge->setVertex(0, teb_.PoseVertex(i));
+    edge->setInformation(information);
+    edge->setEnvelope(station_envelope_);
+    optimizer_->addEdge(edge);
+  }
+}
+
 void TebOptimalPlanner::AddEdgesVelocity()
 {
   if (cfg_->robot.max_vel_y == 0) // non-holonomic robot
@@ -949,7 +1220,8 @@ void TebOptimalPlanner::AddEdgesKinematicsDiffDrive()
   {
     EdgeKinematicsDiffDrive* kinematics_edge = new EdgeKinematicsDiffDrive;
     kinematics_edge->setVertex(0,teb_.PoseVertex(i));
-    kinematics_edge->setVertex(1,teb_.PoseVertex(i+1));      
+    kinematics_edge->setVertex(1,teb_.PoseVertex(i+1));
+    kinematics_edge->setVertex(2,teb_.TimeDiffVertex(i));
     kinematics_edge->setInformation(information_kinematics);
     kinematics_edge->setTebConfig(*cfg_);
     optimizer_->addEdge(kinematics_edge);
@@ -1129,9 +1401,7 @@ void TebOptimalPlanner::extractVelocity(const PoseSE2& pose1, const PoseSE2& pos
   
   if (cfg_->robot.max_vel_y == 0) // nonholonomic robot
   {
-    Eigen::Vector2d conf1dir( cos(pose1.theta()), sin(pose1.theta()) );
-    // translational velocity
-    vx = deltaS.dot(conf1dir) / dt;
+    vx = pose1.longitudinalDistanceTo(pose2, cfg_->useExactArcLength()) / dt;
     vy = 0;
   }
   else // holonomic robot
@@ -1162,8 +1432,49 @@ bool TebOptimalPlanner::getVelocityCommand(double& vx, double& vy, double& omega
     omega = 0;
     return false;
   }
-  const int max_look_ahead_poses = std::max(1, teb_.sizePoses() - 1 - cfg_->trajectory.prevent_look_ahead_poses_near_goal);
+  const bool differential = cfg_->robot.max_vel_y == 0 && cfg_->robot.min_turning_radius == 0;
+  const int max_look_ahead_poses =
+      std::max(1, teb_.sizePoses() - 1 - cfg_->trajectory.prevent_look_ahead_poses_near_goal);
   const double look_ahead_time = cfg_->trajectory.dt_ref * std::max(1, look_ahead_poses);
+  if (differential)
+  {
+    vx = vy = omega = 0;
+    if (!std::isfinite(look_ahead_time) || look_ahead_time <= 0)
+      return false;
+    double duration = 0, surge_integral = 0, yaw_integral = 0;
+    int surge_sign = 0, yaw_sign = 0;
+    // Numerical zero, consistent with the control-trajectory bound tolerance.
+    const auto sign = [](double value) { return (value > 1e-9) - (value < -1e-9); };
+    for (int i = 0; i < max_look_ahead_poses && duration < look_ahead_time; ++i)
+    {
+      const double primitive_dt = teb_.TimeDiff(i);
+      if (!std::isfinite(primitive_dt) || primitive_dt <= 0)
+        return false;
+      double surge, sway, yaw;
+      extractVelocity(teb_.Pose(i), teb_.Pose(i + 1), primitive_dt, surge, sway, yaw);
+      if (!std::isfinite(surge) || !std::isfinite(yaw))
+        return false;
+      const int next_surge_sign = sign(surge), next_yaw_sign = sign(yaw);
+      // Preserve reversals and a rotation following translation (including the
+      // terminal turn). Explicit route turns already bound the transformed plan.
+      if ((surge_sign && next_surge_sign != surge_sign) ||
+          (yaw_sign && next_yaw_sign && next_yaw_sign != yaw_sign))
+        break;
+      if (next_surge_sign) surge_sign = next_surge_sign;
+      if (next_yaw_sign) yaw_sign = next_yaw_sign;
+      const double used_dt = std::min(primitive_dt, look_ahead_time - duration);
+      surge_integral += surge * used_dt;
+      yaw_integral += yaw * used_dt;
+      duration += used_dt;
+    }
+    if (duration <= 0)
+      return false;
+    // Preview controls, not endpoint displacement: a short alignment pivot can
+    // flow into translation. The ROS owner still checks the shaped command arc.
+    vx = surge_integral / duration;
+    omega = yaw_integral / duration;
+    return true;
+  }
   look_ahead_poses = 1;
   double dt = 0.0;
   for(int counter = 0; counter < max_look_ahead_poses; ++counter)
@@ -1269,64 +1580,36 @@ void TebOptimalPlanner::getFullTrajectory(std::vector<TrajectoryPointMsg>& traje
 }
 
 
-bool TebOptimalPlanner::isTrajectoryFeasible(base_local_planner::CostmapModel* costmap_model, const std::vector<geometry_msgs::Point>& footprint_spec,
-                                             double inscribed_radius, double circumscribed_radius, int look_ahead_idx, double feasibility_check_lookahead_distance)
+bool TebOptimalPlanner::isTrajectoryFeasible(SweptFootprint& collision, int look_ahead_idx,
+                                             double feasibility_check_lookahead_distance)
 {
+  if (teb().sizePoses() == 0 || !collision.begin(teb().Pose(0).x(), teb().Pose(0).y(), teb().Pose(0).theta()))
+    return false;
   if (look_ahead_idx < 0 || look_ahead_idx >= teb().sizePoses())
     look_ahead_idx = teb().sizePoses() - 1;
-
-  if (feasibility_check_lookahead_distance > 0){
-    for (int i=1; i < teb().sizePoses(); ++i){
-      double pose_distance=std::hypot(teb().Pose(i).x()-teb().Pose(0).x(), teb().Pose(i).y()-teb().Pose(0).y());
-      if(pose_distance > feasibility_check_lookahead_distance){
-        look_ahead_idx = i - 1;
+  if (feasibility_check_lookahead_distance > 0)
+    for (int i = 1; i < teb().sizePoses(); ++i)
+      if ((teb().Pose(i).position() - teb().Pose(0).position()).norm() > feasibility_check_lookahead_distance) {
+        look_ahead_idx = i;
         break;
       }
-    }
-  }
-
-  for (int i=0; i <= look_ahead_idx; ++i)
-  {           
-    if ( costmap_model->footprintCost(teb().Pose(i).x(), teb().Pose(i).y(), teb().Pose(i).theta(), footprint_spec, inscribed_radius, circumscribed_radius) == -1 )
-    {
+  const bool differential = cfg_->robot.max_vel_y == 0 && cfg_->robot.min_turning_radius == 0;
+  for (int i = 0; i < look_ahead_idx; ++i) {
+    const double dt = teb().TimeDiff(i);
+    if (!std::isfinite(dt) || dt <= 0) return false;
+    const auto& from = teb().Pose(i);
+    const auto& to = teb().Pose(i + 1);
+    const double omega = g2o::normalize_theta(to.theta() - from.theta()) / dt;
+    const double vx = differential ? from.longitudinalDistanceTo(to, true) / dt : (to.x() - from.x()) / dt;
+    const double vy = differential ? 0.0 : (to.y() - from.y()) / dt;
+    if (!collision.advance(vx, vy, omega, dt, !differential)) {
       if (visualization_)
-      {
-        visualization_->publishInfeasibleRobotPose(teb().Pose(i), *cfg_->robot_model, footprint_spec);
-      }
+        visualization_->publishInfeasibleRobotPose(to, *cfg_->robot_model, collision.footprint());
       return false;
-    }
-    // Checks if the distance between two poses is higher than the robot radius or the orientation diff is bigger than the specified threshold
-    // and interpolates in that case.
-    // (if obstacles are pushing two consecutive poses away, the center between two consecutive poses might coincide with the obstacle ;-)!
-    if (i<look_ahead_idx)
-    {
-      double delta_rot = g2o::normalize_theta(g2o::normalize_theta(teb().Pose(i+1).theta()) -
-                                              g2o::normalize_theta(teb().Pose(i).theta()));
-      Eigen::Vector2d delta_dist = teb().Pose(i+1).position()-teb().Pose(i).position();
-      if(fabs(delta_rot) > cfg_->trajectory.min_resolution_collision_check_angular || delta_dist.norm() > inscribed_radius)
-      {
-        int n_additional_samples = std::max(std::ceil(fabs(delta_rot) / cfg_->trajectory.min_resolution_collision_check_angular), 
-                                            std::ceil(delta_dist.norm() / inscribed_radius)) - 1;
-        PoseSE2 intermediate_pose = teb().Pose(i);
-        for(int step = 0; step < n_additional_samples; ++step)
-        {
-          intermediate_pose.position() = intermediate_pose.position() + delta_dist / (n_additional_samples + 1.0);
-          intermediate_pose.theta() = g2o::normalize_theta(intermediate_pose.theta() + 
-                                                           delta_rot / (n_additional_samples + 1.0));
-          if ( costmap_model->footprintCost(intermediate_pose.x(), intermediate_pose.y(), intermediate_pose.theta(),
-            footprint_spec, inscribed_radius, circumscribed_radius) == -1 )
-          {
-            if (visualization_) 
-            {
-              visualization_->publishInfeasibleRobotPose(intermediate_pose, *cfg_->robot_model, footprint_spec);
-            }
-            return false;
-          }
-        }
-      }
     }
   }
   return true;
 }
+
 
 } // namespace teb_local_planner

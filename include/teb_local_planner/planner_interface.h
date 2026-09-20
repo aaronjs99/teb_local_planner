@@ -44,7 +44,7 @@
 
 // ros
 #include <tf/transform_datatypes.h>
-#include <base_local_planner/costmap_model.h>
+#include <teb_local_planner/swept_footprint.h>
 
 // this package
 #include <teb_local_planner/pose_se2.h>
@@ -170,16 +170,12 @@ public:
    * 
    * This method currently checks only that the trajectory, or a part of the trajectory is collision free.
    * Obstacles are here represented as costmap instead of the internal ObstacleContainer.
-   * @param costmap_model Pointer to the costmap model
-   * @param footprint_spec The specification of the footprint of the robot in world coordinates
-   * @param inscribed_radius The radius of the inscribed circle of the robot
-   * @param circumscribed_radius The radius of the circumscribed circle of the robot
+   * @param collision Shared swept-hull evaluator with a fixed observed-map snapshot
    * @param look_ahead_idx Number of poses along the trajectory that should be verified, if -1, the complete trajectory will be checked.
-   * @return \c true, if the robot footprint along the first part of the trajectory intersects with 
-   *         any obstacle in the costmap, \c false otherwise.
+   * @return \c true if the complete checked motion satisfies collision clearance.
    */
-  virtual bool isTrajectoryFeasible(base_local_planner::CostmapModel* costmap_model, const std::vector<geometry_msgs::Point>& footprint_spec,
-        double inscribed_radius = 0.0, double circumscribed_radius=0.0, int look_ahead_idx=-1, double feasibility_check_lookahead_distance=-1.0) = 0;
+  virtual bool isTrajectoryFeasible(SweptFootprint& collision, int look_ahead_idx=-1,
+                                    double feasibility_check_lookahead_distance=-1.0) = 0;
     
   /**
    * Compute and return the cost of the current optimization graph (supports multiple trajectories)

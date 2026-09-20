@@ -99,39 +99,13 @@ public:
     const VertexTimeDiff* dt1 = static_cast<const VertexTimeDiff*>(_vertices[3]);
     const VertexTimeDiff* dt2 = static_cast<const VertexTimeDiff*>(_vertices[4]);
 
-    // VELOCITY & ACCELERATION
-    const Eigen::Vector2d diff1 = pose2->position() - pose1->position();
-    const Eigen::Vector2d diff2 = pose3->position() - pose2->position();
-        
-    double dist1 = diff1.norm();
-    double dist2 = diff2.norm();
     const double angle_diff1 = g2o::normalize_theta(pose2->theta() - pose1->theta());
     const double angle_diff2 = g2o::normalize_theta(pose3->theta() - pose2->theta());
-    
-    if (cfg_->trajectory.exact_arc_length) // use exact arc length instead of Euclidean approximation
-    {
-        if (angle_diff1 != 0)
-        {
-            const double radius =  dist1/(2*sin(angle_diff1/2));
-            dist1 = fabs( angle_diff1 * radius ); // actual arg length!
-        }
-        if (angle_diff2 != 0)
-        {
-            const double radius =  dist2/(2*sin(angle_diff2/2));
-            dist2 = fabs( angle_diff2 * radius ); // actual arg length!
-        }
-    }
-    
-    double vel1 = dist1 / dt1->dt();
-    double vel2 = dist2 / dt2->dt();
-    
-    
-    // consider directions
-//     vel1 *= g2o::sign(diff1[0]*cos(pose1->theta()) + diff1[1]*sin(pose1->theta())); 
-//     vel2 *= g2o::sign(diff2[0]*cos(pose2->theta()) + diff2[1]*sin(pose2->theta())); 
-    vel1 *= fast_sigmoid( 100*(diff1.x()*cos(pose1->theta()) + diff1.y()*sin(pose1->theta())) ); 
-    vel2 *= fast_sigmoid( 100*(diff2.x()*cos(pose2->theta()) + diff2.y()*sin(pose2->theta())) ); 
-    
+    const double vel1 = pose1->pose().longitudinalDistanceTo(
+        pose2->pose(), cfg_->useExactArcLength()) / dt1->dt();
+    const double vel2 = pose2->pose().longitudinalDistanceTo(
+        pose3->pose(), cfg_->useExactArcLength()) / dt2->dt();
+
     const double acc_lin  = (vel2 - vel1)*2 / ( dt1->dt() + dt2->dt() );
    
 
@@ -151,116 +125,7 @@ public:
 
 
 
-#ifdef USE_ANALYTIC_JACOBI
-#if 0
-  /*
-   * @brief Jacobi matrix of the cost function specified in computeError().
-   */
-  void linearizeOplus()
-  {
-    ROS_ASSERT_MSG(cfg_, "You must call setTebConfig on EdgeAcceleration()");
-    const VertexPointXY* conf1 = static_cast<const VertexPointXY*>(_vertices[0]);
-    const VertexPointXY* conf2 = static_cast<const VertexPointXY*>(_vertices[1]);
-    const VertexPointXY* conf3 = static_cast<const VertexPointXY*>(_vertices[2]);
-    const VertexTimeDiff* deltaT1 = static_cast<const VertexTimeDiff*>(_vertices[3]);
-    const VertexTimeDiff* deltaT2 = static_cast<const VertexTimeDiff*>(_vertices[4]);
-    const VertexOrientation* angle1 = static_cast<const VertexOrientation*>(_vertices[5]);
-    const VertexOrientation* angle2 = static_cast<const VertexOrientation*>(_vertices[6]);
-    const VertexOrientation* angle3 = static_cast<const VertexOrientation*>(_vertices[7]);
 
-    Eigen::Vector2d deltaS1 = conf2->estimate() - conf1->estimate();
-    Eigen::Vector2d deltaS2 = conf3->estimate() - conf2->estimate();
-    double dist1 = deltaS1.norm();
-    double dist2 = deltaS2.norm();
-    
-    double sum_time = deltaT1->estimate() + deltaT2->estimate();
-    double sum_time_inv = 1 / sum_time;
-    double dt1_inv = 1/deltaT1->estimate();
-    double dt2_inv = 1/deltaT2->estimate();
-    double aux0 = 2/sum_time_inv;
-    double aux1 = dist1 * deltaT1->estimate();
-    double aux2 = dist2 * deltaT2->estimate();
-
-    double vel1 = dist1 * dt1_inv;
-    double vel2 = dist2 * dt2_inv;
-    double omega1 = g2o::normalize_theta( angle2->estimate() - angle1->estimate() ) * dt1_inv;
-    double omega2 = g2o::normalize_theta( angle3->estimate() - angle2->estimate() ) * dt2_inv;
-    double acc = (vel2 - vel1) * aux0;
-    double omegadot = (omega2 - omega1) * aux0;
-    double aux3 = -acc/2;
-    double aux4 = -omegadot/2;
-    
-    double dev_border_acc = penaltyBoundToIntervalDerivative(acc, tebConfig.robot_acceleration_max_trans,optimizationConfig.optimization_boundaries_epsilon,optimizationConfig.optimization_boundaries_scale,optimizationConfig.optimization_boundaries_order);
-    double dev_border_omegadot = penaltyBoundToIntervalDerivative(omegadot, tebConfig.robot_acceleration_max_rot,optimizationConfig.optimization_boundaries_epsilon,optimizationConfig.optimization_boundaries_scale,optimizationConfig.optimization_boundaries_order);
-    
-    _jacobianOplus[0].resize(2,2); // conf1
-    _jacobianOplus[1].resize(2,2); // conf2
-    _jacobianOplus[2].resize(2,2); // conf3
-    _jacobianOplus[3].resize(2,1); // deltaT1
-    _jacobianOplus[4].resize(2,1); // deltaT2
-    _jacobianOplus[5].resize(2,1); // angle1
-    _jacobianOplus[6].resize(2,1); // angle2
-    _jacobianOplus[7].resize(2,1); // angle3
-    
-    if (aux1==0) aux1=1e-20;
-    if (aux2==0) aux2=1e-20;
-  
-    if (dev_border_acc!=0)
-    {
-      // TODO: double aux = aux0 * dev_border_acc;
-      // double aux123 = aux / aux1;
-      _jacobianOplus[0](0,0) = aux0 * deltaS1[0] / aux1 * dev_border_acc; // acc x1
-      _jacobianOplus[0](0,1) = aux0 * deltaS1[1] / aux1 * dev_border_acc; // acc y1
-      _jacobianOplus[1](0,0) = -aux0 * ( deltaS1[0] / aux1 + deltaS2[0] / aux2 ) * dev_border_acc; // acc x2
-      _jacobianOplus[1](0,1) = -aux0 * ( deltaS1[1] / aux1 + deltaS2[1] / aux2 ) * dev_border_acc; // acc y2
-      _jacobianOplus[2](0,0) = aux0 * deltaS2[0] / aux2 * dev_border_acc; // acc x3
-      _jacobianOplus[2](0,1) = aux0 * deltaS2[1] / aux2 * dev_border_acc; // acc y3	
-      _jacobianOplus[2](0,0) = 0;
-      _jacobianOplus[2](0,1) = 0;
-      _jacobianOplus[3](0,0) = aux0 * (aux3 + vel1 * dt1_inv) * dev_border_acc; // acc deltaT1
-      _jacobianOplus[4](0,0) = aux0 * (aux3 - vel2 * dt2_inv) * dev_border_acc; // acc deltaT2
-    }
-    else
-    {
-      _jacobianOplus[0](0,0) = 0; // acc x1
-      _jacobianOplus[0](0,1) = 0; // acc y1	
-      _jacobianOplus[1](0,0) = 0; // acc x2
-      _jacobianOplus[1](0,1) = 0; // acc y2
-      _jacobianOplus[2](0,0) = 0; // acc x3
-      _jacobianOplus[2](0,1) = 0; // acc y3	
-      _jacobianOplus[3](0,0) = 0; // acc deltaT1
-      _jacobianOplus[4](0,0) = 0; // acc deltaT2
-    }
-    
-    if (dev_border_omegadot!=0)
-    {
-      _jacobianOplus[3](1,0) = aux0 * ( aux4 + omega1 * dt1_inv ) * dev_border_omegadot; // omegadot deltaT1
-      _jacobianOplus[4](1,0) = aux0 * ( aux4 - omega2 * dt2_inv ) * dev_border_omegadot; // omegadot deltaT2
-      _jacobianOplus[5](1,0) = aux0 * dt1_inv * dev_border_omegadot; // omegadot angle1
-      _jacobianOplus[6](1,0) = -aux0 * ( dt1_inv + dt2_inv ) * dev_border_omegadot; // omegadot angle2
-      _jacobianOplus[7](1,0) = aux0 * dt2_inv * dev_border_omegadot; // omegadot angle3
-    }
-    else
-    {
-      _jacobianOplus[3](1,0) = 0; // omegadot deltaT1
-      _jacobianOplus[4](1,0) = 0; // omegadot deltaT2
-      _jacobianOplus[5](1,0) = 0; // omegadot angle1
-      _jacobianOplus[6](1,0) = 0; // omegadot angle2
-      _jacobianOplus[7](1,0) = 0; // omegadot angle3			
-    }
-
-    _jacobianOplus[0](1,0) = 0; // omegadot x1
-    _jacobianOplus[0](1,1) = 0; // omegadot y1
-    _jacobianOplus[1](1,0) = 0; // omegadot x2
-    _jacobianOplus[1](1,1) = 0; // omegadot y2
-    _jacobianOplus[2](1,0) = 0; // omegadot x3
-    _jacobianOplus[2](1,1) = 0; // omegadot y3
-    _jacobianOplus[5](0,0) = 0; // acc angle1
-    _jacobianOplus[6](0,0) = 0; // acc angle2
-    _jacobianOplus[7](0,0) = 0; // acc angle3
-    }
-#endif
-#endif
 
       
 public: 
@@ -313,22 +178,11 @@ public:
     const VertexTimeDiff* dt = static_cast<const VertexTimeDiff*>(_vertices[2]);
 
     // VELOCITY & ACCELERATION
-    const Eigen::Vector2d diff = pose2->position() - pose1->position();
-    double dist = diff.norm();
     const double angle_diff = g2o::normalize_theta(pose2->theta() - pose1->theta());
-    if (cfg_->trajectory.exact_arc_length && angle_diff != 0)
-    {
-        const double radius =  dist/(2*sin(angle_diff/2));
-        dist = fabs( angle_diff * radius ); // actual arg length!
-    }
-    
+    const double vel2 = pose1->pose().longitudinalDistanceTo(
+        pose2->pose(), cfg_->useExactArcLength()) / dt->dt();
     const double vel1 = _measurement->linear.x;
-    double vel2 = dist / dt->dt();
 
-    // consider directions
-    //vel2 *= g2o::sign(diff[0]*cos(pose1->theta()) + diff[1]*sin(pose1->theta())); 
-    vel2 *= fast_sigmoid( 100*(diff.x()*cos(pose1->theta()) + diff.y()*sin(pose1->theta())) ); 
-    
     const double acc_lin  = (vel2 - vel1) / dt->dt();
     
     _error[0] = penaltyBoundToInterval(acc_lin,cfg_->robot.acc_lim_x,cfg_->optim.penalty_epsilon);
@@ -405,22 +259,11 @@ public:
 
     // VELOCITY & ACCELERATION
 
-    const Eigen::Vector2d diff = pose_goal->position() - pose_pre_goal->position();  
-    double dist = diff.norm();
     const double angle_diff = g2o::normalize_theta(pose_goal->theta() - pose_pre_goal->theta());
-    if (cfg_->trajectory.exact_arc_length  && angle_diff != 0)
-    {
-        double radius =  dist/(2*sin(angle_diff/2));
-        dist = fabs( angle_diff * radius ); // actual arg length!
-    }
-    
-    double vel1 = dist / dt->dt();
+    const double vel1 = pose_pre_goal->pose().longitudinalDistanceTo(
+        pose_goal->pose(), cfg_->useExactArcLength()) / dt->dt();
     const double vel2 = _measurement->linear.x;
-    
-    // consider directions
-    //vel1 *= g2o::sign(diff[0]*cos(pose_pre_goal->theta()) + diff[1]*sin(pose_pre_goal->theta())); 
-    vel1 *= fast_sigmoid( 100*(diff.x()*cos(pose_pre_goal->theta()) + diff.y()*sin(pose_pre_goal->theta())) ); 
-    
+
     const double acc_lin  = (vel2 - vel1) / dt->dt();
 
     _error[0] = penaltyBoundToInterval(acc_lin,cfg_->robot.acc_lim_x,cfg_->optim.penalty_epsilon);

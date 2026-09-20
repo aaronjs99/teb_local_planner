@@ -413,18 +413,18 @@ public:
    *
    * This method initializes the timed elastic band using a pose container
    * (e.g. as local plan from the ros navigation stack). \n
-   * The initial time difference between two consecutive poses can be uniformly set
-   * via the argument \c dt.
+   * Time differences follow the supplied translational and rotational speed limits.
    * @param plan vector of geometry_msgs::PoseStamped
    * @param max_vel_x maximum translational velocity used for determining time differences
    * @param max_vel_theta maximum rotational velocity used for determining time differences
    * @param estimate_orient if \c true, calculate orientation using the straight line distance vector between consecutive poses
    *                        (only copy start and goal orientation; recommended if no orientation data is available).
    * @param min_samples Minimum number of samples that should be initialized at least
-   * @param guess_backwards_motion Allow the initialization of backwards oriented trajectories if the goal heading is pointing behind the robot (this parameter is used only if \c estimate_orient is enabled.
+   * @param guess_backwards_motion Allow reverse-oriented segments when estimating orientation or constructing a pivot seed.
+   * @param pivot_seed Initialize differential-drive paths with pivot and drive segments, preserving endpoint headings.
    * @return true if everything was fine, false otherwise
    */
-  bool initTrajectoryToGoal(const std::vector<geometry_msgs::PoseStamped>& plan, double max_vel_x, double max_vel_theta, bool estimate_orient=false, int min_samples = 3, bool guess_backwards_motion = false);
+  bool initTrajectoryToGoal(const std::vector<geometry_msgs::PoseStamped>& plan, double max_vel_x, double max_vel_theta, bool estimate_orient=false, int min_samples = 3, bool guess_backwards_motion = false, bool pivot_seed = false);
 
 
   ROS_DEPRECATED bool initTEBtoGoal(const PoseSE2& start, const PoseSE2& goal, double diststep=0, double timestep=1, int min_samples = 3, bool guess_backwards_motion = false)
@@ -472,7 +472,7 @@ public:
    * @param new_goal New goal pose (optional)
    * @param min_samples Specify the minimum number of samples that should at least remain in the trajectory
    */  
-  void updateAndPruneTEB(boost::optional<const PoseSE2&> new_start, boost::optional<const PoseSE2&> new_goal, int min_samples = 3);
+  void updateAndPruneTEB(boost::optional<const PoseSE2&> new_start, boost::optional<const PoseSE2&> new_goal, int min_samples = 3, double max_vel_x = 0, double max_vel_theta = 0);
   
   
   /**

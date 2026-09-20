@@ -40,10 +40,12 @@
 #define OPTIMAL_PLANNER_H_
 
 #include <math.h>
+#include <chrono>
 
 
 // teb stuff
 #include <teb_local_planner/teb_config.h>
+#include <teb_local_planner/station_envelope.h>
 #include <teb_local_planner/misc.h>
 #include <teb_local_planner/timed_elastic_band.h>
 #include <teb_local_planner/planner_interface.h>
@@ -100,6 +102,14 @@ typedef std::vector< Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d> 
 class TebOptimalPlanner : public PlannerInterface
 {
 public:
+  // Caller serializes this with plan/clear through the ROS planner mutex.
+  bool setStationEnvelope(const StationEnvelope& envelope) {
+    if (!envelope.valid()) return false;
+    if (!(station_envelope_ == envelope)) clearPlanner();
+    station_envelope_ = envelope;
+    return true;
+  }
+
     
   /**
    * @brief Default constructor
@@ -489,16 +499,12 @@ public:
    * 
    * This method currently checks only that the trajectory, or a part of the trajectory is collision free.
    * Obstacles are here represented as costmap instead of the internal ObstacleContainer.
-   * @param costmap_model Pointer to the costmap model
-   * @param footprint_spec The specification of the footprint of the robot in world coordinates
-   * @param inscribed_radius The radius of the inscribed circle of the robot
-   * @param circumscribed_radius The radius of the circumscribed circle of the robot
+   * @param collision Shared swept-hull evaluator with a fixed observed-map snapshot
    * @param look_ahead_idx Number of poses along the trajectory that should be verified, if -1, the complete trajectory will be checked.
-   * @return \c true, if the robot footprint along the first part of the trajectory intersects with 
-   *         any obstacle in the costmap, \c false otherwise.
+   * @return \c true if the complete checked motion satisfies collision clearance.
    */
-  virtual bool isTrajectoryFeasible(base_local_planner::CostmapModel* costmap_model, const std::vector<geometry_msgs::Point>& footprint_spec, double inscribed_radius = 0.0,
-          double circumscribed_radius=0.0, int look_ahead_idx=-1, double feasibility_check_lookahead_distance=-1.0);
+  virtual bool isTrajectoryFeasible(SweptFootprint& collision, int look_ahead_idx=-1,
+                                    double feasibility_check_lookahead_distance=-1.0);
   
   //@}
   
@@ -533,6 +539,8 @@ protected:
    * @param clear_after Clear the graph after optimization.
    * @return \c true, if optimization terminates successfully, \c false otherwise.
    */
+  bool optimizeControlTrajectory(int iterations, const PoseSE2& goal);
+
   bool optimizeGraph(int no_iterations, bool clear_after=true);
   
   /**
@@ -616,6 +624,7 @@ protected:
    * @see optimizeGraph
    */
   void AddEdgesViaPoints();
+  void AddEdgesStationEnvelope();
   
   /**
    * @brief Add all edges (local cost functions) related to keeping a distance from dynamic (moving) obstacles.
@@ -672,6 +681,7 @@ protected:
     
 
   // external objects (store weak pointers)
+  StationEnvelope station_envelope_;
   const TebConfig* cfg_; //!< Config class that stores and manages all related parameters
   ObstContainer* obstacles_; //!< Store obstacles that are relevant for planning
   const ViaPointContainer* via_points_; //!< Store via points for planning
@@ -688,6 +698,7 @@ protected:
   std::pair<bool, geometry_msgs::Twist> vel_goal_; //!< Store the final velocity at the goal pose
 
   bool initialized_; //!< Keeps track about the correct initialization of this class
+  std::chrono::steady_clock::time_point control_deadline_;
   bool optimized_; //!< This variable is \c true as long as the last optimization has been completed successful
   
 public:

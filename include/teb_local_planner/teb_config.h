@@ -62,6 +62,11 @@ namespace teb_local_planner
 class TebConfig
 {
 public:
+  bool useExactArcLength() const
+  {
+    return trajectory.exact_arc_length || (robot.max_vel_y == 0 && robot.min_turning_radius == 0);
+  }
+
 
   std::string odom_topic; //!< Topic name of the odometry message, provided by the robot driver or simulator
   std::string map_frame; //!< Global planning frame

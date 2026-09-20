@@ -50,6 +50,7 @@
 #include "g2o/core/hyper_graph_action.h"
 
 #include <Eigen/Core>
+#include <cmath>
 
 namespace teb_local_planner
 {
@@ -107,12 +108,15 @@ public:
 
   /**
     * @brief Define the update increment \f$ \Delta T_{k+1} = \Delta T_k + update \f$.
-    * A simple addition implements what we want.
+    * Keep duration positive with a retraction whose derivative at zero is one.
     * @param update increment that should be added to the previous esimate
     */ 
   virtual void oplusImpl(const double* update) override
   {
-      _estimate += *update;
+      const double next = *update >= 0.0
+          ? _estimate + *update : _estimate / (1.0 - *update / _estimate);
+      if (std::isfinite(next) && next > 0.0)
+          _estimate = next;
   }
 
   /**

@@ -36,6 +36,7 @@ message(STATUS "${CMAKE_MODULE_PATH}")
 find_package(Boost REQUIRED COMPONENTS system thread graph)
 find_package(SUITESPARSE REQUIRED)
 find_package(G2O REQUIRED)
+find_package(NLopt REQUIRED)
 
 # Eigen3 FindScript Backward compatibility (ubuntu saucy)
 # Since FindEigen.cmake is deprecated starting from jade.
@@ -180,8 +181,8 @@ add_dependencies(teb_local_planner ${PROJECT_NAME}_gencfg)
 add_dependencies(teb_local_planner ${PROJECT_NAME}_generate_messages_cpp)
 
 target_link_libraries(teb_local_planner
-   ${EXTERNAL_LIBS}
-   ${catkin_LIBRARIES}
+   PUBLIC ${EXTERNAL_LIBS} ${catkin_LIBRARIES}
+   PRIVATE NLopt::nlopt
 )
 
 
