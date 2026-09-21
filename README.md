@@ -129,8 +129,12 @@ Station mode penalizes distance from the requested station center throughout the
 
 Robots with zero lateral velocity and zero minimum turning radius initialize
 reference paths with pivot and drive segments, preserving the start and goal
-headings. The optimizer may smooth these segments. Pose-only and path inputs
-share this initialization, including the requested final-velocity mode.
+headings. Planner tangent headings at translated interior path samples are
+steering hints rather than required turns; explicit in-place turns and the
+terminal heading remain required. This lets a reverse segment retain its
+heading between path samples. The optimizer may smooth these segments.
+Pose-only and path inputs share this initialization, including the requested
+final-velocity mode.
 
 The differential-drive lateral-motion cost integrates squared lateral velocity
 over each existing time interval, so subdividing the same timed path does not

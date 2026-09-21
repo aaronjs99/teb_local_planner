@@ -439,7 +439,12 @@ bool TimedElasticBand::initTrajectoryToGoal(const std::vector<geometry_msgs::Pos
             tf::createQuaternionMsgFromYaw(travel_heading);
         seed.push_back(translated);
       }
-      appendTurnTo(next.theta());
+      // GlobalPlanner headings at translated interior samples are path
+      // tangents, not mandatory turns. Following each one would flip a
+      // reverse segment back to forward at every path sample. Preserve only
+      // an explicit in-place turn or the declared terminal heading.
+      if (i + 1 == guide.size() || delta.norm() <= coincident_position)
+        appendTurnTo(next.theta());
     }
     return initTrajectoryToGoal(seed, max_vel_x, max_vel_theta, false,
                                 min_samples, guess_backwards_motion, false);

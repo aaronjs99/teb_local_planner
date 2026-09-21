@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <cmath>
 
 #include <teb_local_planner/timed_elastic_band.h>
 #include <teb_local_planner/terminal_observation.h>
@@ -67,6 +68,46 @@ TEST(TEBBasic, autoResize)
   }
 }
 
+
+TEST(TEBBasic, reversePathTangentsDoNotBecomeRequiredTurns)
+{
+  std::vector<geometry_msgs::PoseStamped> path(3);
+  path[0].pose.orientation.w = 1.0;
+  path[1].pose.position.x = -1.0;
+  path[1].pose.orientation.z = 1.0; // GlobalPlanner tangent: 180 degrees.
+  path[2].pose.position.x = -2.0;
+  path[2].pose.orientation.w = 1.0; // Requested terminal heading: zero.
+
+  teb_local_planner::TimedElasticBand teb;
+  ASSERT_TRUE(teb.initTrajectoryToGoal(path, 0.08, 0.035, false, 3, true, true));
+  for (int i = 0; i < teb.sizePoses(); ++i)
+    EXPECT_NEAR(teb.Pose(i).theta(), 0.0, 1e-6);
+  EXPECT_NEAR(teb.BackPose().x(), -2.0, 1e-6);
+}
+
+TEST(TEBBasic, explicitInteriorTurnIsRetained)
+{
+  std::vector<geometry_msgs::PoseStamped> path(4);
+  for (auto& pose : path) pose.pose.orientation.w = 1.0;
+  path[1].pose.position.x = 1.0;
+  path[2].pose.position.x = 1.0;
+  path[2].pose.orientation.z = std::sin(M_PI / 4);
+  path[2].pose.orientation.w = std::cos(M_PI / 4);
+  path[3].pose.position.x = 1.0;
+  path[3].pose.position.y = 1.0;
+  path[3].pose.orientation = path[2].pose.orientation;
+
+  teb_local_planner::TimedElasticBand teb;
+  ASSERT_TRUE(teb.initTrajectoryToGoal(path, 0.08, 0.035, false, 3, true, true));
+  bool saw_stationary_turn = false;
+  for (int i = 1; i < teb.sizePoses(); ++i)
+    if (std::hypot(teb.Pose(i).x() - teb.Pose(i-1).x(),
+                   teb.Pose(i).y() - teb.Pose(i-1).y()) < 1e-6 &&
+        std::abs(teb.Pose(i).theta() - teb.Pose(i-1).theta()) > 1e-6)
+      saw_stationary_turn = true;
+  EXPECT_TRUE(saw_stationary_turn);
+  EXPECT_NEAR(teb.BackPose().theta(), M_PI / 2, 1e-6);
+}
 
 TEST(TEBBasic, terminalObservationKeepsSnapshotWhileRoutePhaseIsPending)
 {
