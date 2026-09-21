@@ -422,9 +422,10 @@ public:
    * @param min_samples Minimum number of samples that should be initialized at least
    * @param guess_backwards_motion Allow reverse-oriented segments when estimating orientation or constructing a pivot seed.
    * @param pivot_seed Initialize differential-drive paths with pivot and drive segments, preserving endpoint headings.
+   * @param terminal_yaw Optional unwrapped final heading for preserving an existing pivot-seed angular branch.
    * @return true if everything was fine, false otherwise
    */
-  bool initTrajectoryToGoal(const std::vector<geometry_msgs::PoseStamped>& plan, double max_vel_x, double max_vel_theta, bool estimate_orient=false, int min_samples = 3, bool guess_backwards_motion = false, bool pivot_seed = false);
+  bool initTrajectoryToGoal(const std::vector<geometry_msgs::PoseStamped>& plan, double max_vel_x, double max_vel_theta, bool estimate_orient=false, int min_samples = 3, bool guess_backwards_motion = false, bool pivot_seed = false, boost::optional<double> terminal_yaw = boost::none);
 
 
   ROS_DEPRECATED bool initTEBtoGoal(const PoseSE2& start, const PoseSE2& goal, double diststep=0, double timestep=1, int min_samples = 3, bool guess_backwards_motion = false)

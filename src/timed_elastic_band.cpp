@@ -386,7 +386,7 @@ bool TimedElasticBand::initTrajectoryToGoal(const PoseSE2& start, const PoseSE2&
 }
 
 
-bool TimedElasticBand::initTrajectoryToGoal(const std::vector<geometry_msgs::PoseStamped>& plan, double max_vel_x, double max_vel_theta, bool estimate_orient, int min_samples, bool guess_backwards_motion, bool pivot_seed)
+bool TimedElasticBand::initTrajectoryToGoal(const std::vector<geometry_msgs::PoseStamped>& plan, double max_vel_x, double max_vel_theta, bool estimate_orient, int min_samples, bool guess_backwards_motion, bool pivot_seed, boost::optional<double> terminal_yaw)
 {
   if (pivot_seed && !isInit() && plan.size() >= 2)
   {
@@ -410,10 +410,12 @@ bool TimedElasticBand::initTrajectoryToGoal(const std::vector<geometry_msgs::Pos
     guide.push_back(plan.back());
 
     std::vector<geometry_msgs::PoseStamped> seed(1, guide.front());
-    const auto appendTurnTo = [&](double target_yaw) {
+    double seed_yaw = tf::getYaw(seed.front().pose.orientation);
+    const auto appendTurnTo = [&](double target_yaw, bool terminal = false) {
       const geometry_msgs::PoseStamped from = seed.back();
       const double yaw = tf::getYaw(from.pose.orientation);
-      const double turn = g2o::normalize_theta(target_yaw-yaw);
+      const double turn = terminal && terminal_yaw
+          ? *terminal_yaw-seed_yaw : g2o::normalize_theta(target_yaw-yaw);
       if (std::abs(turn) <= 1e-9) return;
       const int count = std::max(1, int(std::ceil(std::abs(turn)/(M_PI/2))));
       for (int j=1; j<=count; ++j) {
@@ -422,6 +424,7 @@ bool TimedElasticBand::initTrajectoryToGoal(const std::vector<geometry_msgs::Pos
             tf::createQuaternionMsgFromYaw(yaw+turn*double(j)/count);
         seed.push_back(point);
       }
+      seed_yaw += turn;
     };
 
     for (std::size_t i=1; i<guide.size(); ++i) {
@@ -444,7 +447,7 @@ bool TimedElasticBand::initTrajectoryToGoal(const std::vector<geometry_msgs::Pos
       // reverse segment back to forward at every path sample. Preserve only
       // an explicit in-place turn or the declared terminal heading.
       if (i + 1 == guide.size() || delta.norm() <= coincident_position)
-        appendTurnTo(next.theta());
+        appendTurnTo(next.theta(), i + 1 == guide.size());
     }
     return initTrajectoryToGoal(seed, max_vel_x, max_vel_theta, false,
                                 min_samples, guess_backwards_motion, false);

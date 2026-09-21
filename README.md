@@ -134,7 +134,20 @@ steering hints rather than required turns; explicit in-place turns and the
 terminal heading remain required. This lets a reverse segment retain its
 heading between path samples. The optimizer may smooth these segments.
 Pose-only and path inputs share this initialization, including the requested
-final-velocity mode.
+final-velocity mode. Terminal heading winding is reconstructed from the
+executable pivot/drive seed, not accumulated from arbitrary headings on translated
+guide samples. Explicit in-place revolutions retain their signed winding; warm
+starts and cold fallback preserve the selected branch across the +/-pi
+representation boundary, including when the measured start crosses that boundary.
+Both cold and updated seeds use the same interval subdivision before bounded
+optimization.
+
+The shared swept-footprint helper also evaluates an optional terminal sensing
+margin beyond the padded hull. It uses Euclidean distance to unknown cells and
+requires known-obstacle padded-buffer overlap to have cleared at that endpoint.
+Zero extra margin preserves ordinary route escape behavior. MARINER uses this
+helper directly on the owned global costmap during route reconnection, while TEB
+uses it on local trajectories and selected commands.
 
 The differential-drive lateral-motion cost integrates squared lateral velocity
 over each existing time interval, so subdividing the same timed path does not

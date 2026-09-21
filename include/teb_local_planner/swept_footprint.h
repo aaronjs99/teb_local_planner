@@ -212,6 +212,63 @@ class SweptFootprint {
     return true;
   }
 
+  // Extra unknown-space clearance belongs only to the terminal sensing pose.
+  // Use Euclidean polygon/cell distance; SAT separation alone underestimates
+  // diagonal clearance. Ordinary navigation requests zero extra margin.
+  bool terminalSensingClearance(double margin) {
+    if (!begun_ || !std::isfinite(margin) || margin < 0)
+      return fail("invalid_terminal_unknown_clearance");
+    if (margin == 0) return true;
+    const Polygon polygon = at(padded_, pose_);
+    // A frontier sensing endpoint must have cleared the initial known buffer
+    // overlap, even though an ordinary escape route may still be separating.
+    for (const auto& cell : cells_)
+      if (!cell.unknown && separation(polygon,cell) < -epsilon_)
+        return fail("terminal_padded_hull_in_obstacle");
+    double xmin=right_, xmax=left_, ymin=top_, ymax=bottom_;
+    for (const auto& p : polygon) {
+      if (p.x-margin < left_-epsilon_ || p.x+margin > right_+epsilon_ ||
+          p.y-margin < bottom_-epsilon_ || p.y+margin > top_+epsilon_)
+        return fail("terminal_unknown_clearance_outside_map");
+      xmin=std::min(xmin,p.x); xmax=std::max(xmax,p.x);
+      ymin=std::min(ymin,p.y); ymax=std::max(ymax,p.y);
+    }
+    const auto point_segment = [](const geometry_msgs::Point& p,
+                                  const geometry_msgs::Point& a,
+                                  const geometry_msgs::Point& b) {
+      const double dx=b.x-a.x, dy=b.y-a.y;
+      const double t=std::max(0.0,std::min(1.0,
+          ((p.x-a.x)*dx+(p.y-a.y)*dy)/(dx*dx+dy*dy)));
+      return std::hypot(p.x-a.x-t*dx,p.y-a.y-t*dy);
+    };
+    const int x0=std::max(0,int(std::floor((xmin-margin-left_)/resolution_)));
+    const int x1=std::min(int(width_)-1,int(std::floor((xmax+margin-left_)/resolution_)));
+    const int y0=std::max(0,int(std::floor((ymin-margin-bottom_)/resolution_)));
+    const int y1=std::min(int(height_)-1,int(std::floor((ymax+margin-bottom_)/resolution_)));
+    for (int y=y0;y<=y1;++y) for (int x=x0;x<=x1;++x) {
+      if (observed_[index(x,y)]) continue;
+      Cell cell;
+      cell.x=left_+(x+.5)*resolution_; cell.y=bottom_+(y+.5)*resolution_;
+      if (separation(polygon,cell)<=epsilon_)
+        return fail("terminal_padded_hull_overlaps_unknown_space");
+      Polygon square(4);
+      for (int j=0;j<4;++j) {
+        square[j].x=cell.x+resolution_*.5*((j==0 || j==3)?-1:1);
+        square[j].y=cell.y+resolution_*.5*(j<2?-1:1);
+      }
+      double distance=std::numeric_limits<double>::infinity();
+      for (std::size_t i=0;i<polygon.size();++i) for (int j=0;j<4;++j) {
+        distance=std::min(distance,point_segment(
+            polygon[i],square[j],square[(j+1)%4]));
+        distance=std::min(distance,point_segment(
+            square[j],polygon[i],polygon[(i+1)%polygon.size()]));
+      }
+      if (distance+epsilon_<margin)
+        return fail("terminal_unknown_clearance_violation");
+    }
+    return true;
+  }
+
  private:
   struct Pose { double x, y, yaw; };
   struct Cell {

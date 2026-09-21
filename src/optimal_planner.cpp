@@ -260,29 +260,37 @@ bool TebOptimalPlanner::plan(const std::vector<geometry_msgs::PoseStamped>& init
   control_deadline_ = std::chrono::steady_clock::now() +
       std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(cfg_->trajectory.dt_ref));
   const bool differential = cfg_->robot.max_vel_y == 0 && cfg_->robot.min_turning_radius == 0;
-  const PoseSE2 start(initial_plan.front().pose);
+  PoseSE2 start(initial_plan.front().pose);
   PoseSE2 goal(initial_plan.back().pose);
-  goal.theta() = start.theta();
-  for (std::size_t i = 1; i < initial_plan.size(); ++i)
-    goal.theta() += g2o::normalize_theta(PoseSE2(initial_plan[i].pose).theta() -
-                                       PoseSE2(initial_plan[i-1].pose).theta());
+  if (differential)
+    goal.theta() = start.theta() + g2o::normalize_theta(goal.theta() - start.theta());
+  else {
+    goal.theta() = start.theta();
+    for (std::size_t i = 1; i < initial_plan.size(); ++i)
+      goal.theta() += g2o::normalize_theta(PoseSE2(initial_plan[i].pose).theta() -
+                                         PoseSE2(initial_plan[i-1].pose).theta());
+  }
   // Keep the chosen angular branch while replanning the same goal.  Near the
   // antipodal heading, independently wrapping every update can alternate
   // between +pi and -pi and reverse the command before either turn completes.
-  if (teb_.isInit() &&
+  const bool warm_start = teb_.isInit() &&
       (goal.position()-teb_.BackPose().position()).norm() <
           cfg_->trajectory.force_reinit_new_goal_dist &&
       std::abs(g2o::normalize_theta(goal.theta()-teb_.BackPose().theta())) <
-          cfg_->trajectory.force_reinit_new_goal_angular)
+          cfg_->trajectory.force_reinit_new_goal_angular;
+  if (warm_start) {
+    if (differential)
+      start.theta() = teb_.Pose(0).theta() +
+          g2o::normalize_theta(start.theta()-teb_.Pose(0).theta());
     goal.theta() = teb_.BackPose().theta() +
         g2o::normalize_theta(goal.theta()-teb_.BackPose().theta());
-  const auto initialize = [&]() {
-    teb_.clearTimedElasticBand();
-    teb_.initTrajectoryToGoal(initial_plan, cfg_->robot.max_vel_x, cfg_->robot.max_vel_theta,
-        cfg_->trajectory.global_plan_overwrite_orientation, cfg_->trajectory.min_samples,
-        cfg_->trajectory.allow_init_with_backwards_motion, differential);
-    teb_.BackPose().theta() = goal.theta();
-    if (!differential) return;
+  }
+  // The message represents start yaw modulo 2pi. Express the retained terminal
+  // branch in that same starting representation when constructing a cold seed.
+  const boost::optional<double> seed_terminal_yaw = differential && warm_start
+      ? boost::optional<double>(goal.theta()-start.theta()+
+          PoseSE2(initial_plan.front().pose).theta()) : boost::none;
+  const auto subdivide = [&]() {
     // Subdivide without changing geometry so bounded controls retain the endpoint.
     const double max_interval = M_PI/(2*std::max(1e-6,cfg_->robot.max_vel_theta));
     for (int i = 0; i < teb_.sizeTimeDiffs(); ++i)
@@ -308,15 +316,31 @@ bool TebOptimalPlanner::plan(const std::vector<geometry_msgs::PoseStamped>& init
     for (int i = 0; i < teb_.sizePoses(); ++i)
       teb_.setPoseVertexFixed(i, i == 0);
   };
-  const bool warm_start = teb_.isInit() &&
-      (goal.position() - teb_.BackPose().position()).norm() < cfg_->trajectory.force_reinit_new_goal_dist &&
-      std::abs(g2o::normalize_theta(goal.theta() - teb_.BackPose().theta())) < cfg_->trajectory.force_reinit_new_goal_angular;
-  if (warm_start)
+  const auto initialize = [&]() {
+    teb_.clearTimedElasticBand();
+    teb_.initTrajectoryToGoal(initial_plan, cfg_->robot.max_vel_x, cfg_->robot.max_vel_theta,
+        cfg_->trajectory.global_plan_overwrite_orientation, cfg_->trajectory.min_samples,
+        cfg_->trajectory.allow_init_with_backwards_motion, differential, seed_terminal_yaw);
+    if (differential) {
+      // The executable seed owns the winding: translated path headings are
+      // tangents, whereas explicit in-place turns remain in the seed. Summing
+      // the raw guide headings can require a full revolution absent from the
+      // actual motion and make an otherwise feasible seed fail endpoint equality.
+      goal.theta() = teb_.Pose(0).theta();
+      for (int i = 1; i < teb_.sizePoses(); ++i)
+        goal.theta() += g2o::normalize_theta(teb_.Pose(i).theta() - teb_.Pose(i-1).theta());
+    }
+    teb_.BackPose().theta() = goal.theta();
+    if (!differential) return;
+    subdivide();
+  };
+  if (warm_start) {
     // The shifted band is only a guess. The control rollout must recover an
     // executable trajectory and the requested endpoint before it can be used.
     teb_.updateAndPruneTEB(start, goal, cfg_->trajectory.min_samples,
         differential ? cfg_->robot.max_vel_x : 0, differential ? cfg_->robot.max_vel_theta : 0);
-  else
+    if (differential) subdivide();
+  } else
     initialize();
   if (start_vel)
     setVelocityStart(*start_vel);
